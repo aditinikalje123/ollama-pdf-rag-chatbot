@@ -1,3 +1,4 @@
+
 # 🤖 Chat with PDF locally using Ollama + LangChain
 
 A powerful local RAG (Retrieval Augmented Generation) application that lets you chat with your PDF documents using Ollama and LangChain. This project includes multiple interfaces: a modern Next.js web app, a Streamlit interface, and Jupyter notebooks for experimentation.
@@ -221,3 +222,6 @@ This project is open source and available under the MIT License.
 Built with ❤️ by [Tony Kipkemboi](https://tonykipkemboi.com)
 
 Follow me on [X](https://x.com/tonykipkemboi) | [LinkedIn](https://www.linkedin.com/in/tonykipkemboi/) | [YouTube](https://www.youtube.com/@tonykipkemboi) | [GitHub](https://github.com/tonykipkemboi)
+=======
+# ollama-pdf-rag-chatbot
+

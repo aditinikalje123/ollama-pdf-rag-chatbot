@@ -31,3 +31,5 @@ web-ui/data/*.db
 .coverage
 htmlcov/
 coverage.xml
+
+ragenv/

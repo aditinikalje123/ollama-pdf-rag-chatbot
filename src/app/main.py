@@ -1,14 +1,15 @@
 """
-Streamlit application for PDF-based Retrieval-Augmented Generation (RAG)
-using Ollama + LangChain.
+Secure PDF RAG Assistant
 
 Features:
 - Multiple PDF upload
 - Normal PDF text extraction using PyMuPDF
-- Automatic OCR fallback for scanned/image PDFs
-- Local embeddings using Ollama
+- OCR fallback for scanned PDFs
+- Local Ollama embeddings when running locally
+- HuggingFace embeddings when deployed with Groq
 - ChromaDB vector database
-- Local LLM using Ollama
+- Local Ollama LLM when running locally
+- Groq cloud LLM when GROQ_API_KEY is available
 - Source filename and page numbers
 - PDF viewer
 """
@@ -19,7 +20,6 @@ import os
 import tempfile
 import shutil
 import io
-import ollama
 import warnings
 
 from datetime import datetime
@@ -29,12 +29,16 @@ from typing import List, Tuple, Dict, Any, Optional
 import fitz
 
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+from langchain_ollama import OllamaEmbeddings
 from langchain_ollama import ChatOllama
+
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 
 
 # ============================================================
@@ -50,6 +54,12 @@ warnings.filterwarnings(
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 PERSIST_DIRECTORY = os.path.join("data", "vectors")
+
+GROQ_MODEL = "openai/gpt-oss-20b"
+OLLAMA_EMBEDDING_MODEL = "nomic-embed-text:latest"
+OLLAMA_DEFAULT_MODEL = "llama3.2:3b"
+
+HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
 # ============================================================
@@ -78,31 +88,111 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# MODEL HELPERS
+# ============================================================
+
+def using_groq() -> bool:
+    """Return True when a Groq API key is available."""
+    return bool(os.getenv("GROQ_API_KEY"))
+
+
+def get_embeddings():
+    """
+    Use HuggingFace embeddings on Render/Groq deployment.
+
+    Use Ollama embeddings locally when GROQ_API_KEY
+    is not available.
+    """
+
+    if using_groq():
+        logger.info(
+            "Using HuggingFace embeddings for cloud deployment"
+        )
+
+        return HuggingFaceEmbeddings(
+            model_name=HF_EMBEDDING_MODEL,
+            model_kwargs={
+                "device": "cpu"
+            },
+            encode_kwargs={
+                "normalize_embeddings": True
+            },
+        )
+
+    logger.info(
+        "Using local Ollama embeddings"
+    )
+
+    return OllamaEmbeddings(
+        model=OLLAMA_EMBEDDING_MODEL
+    )
+
+
+def get_llm(selected_model: str):
+    """
+    Return Groq LLM when deployed with GROQ_API_KEY.
+    Otherwise return local Ollama LLM.
+    """
+
+    groq_api_key = os.getenv("GROQ_API_KEY")
+
+    if groq_api_key:
+        logger.info(
+            f"Using Groq model: {GROQ_MODEL}"
+        )
+
+        return ChatGroq(
+            model=GROQ_MODEL,
+            temperature=0,
+            groq_api_key=groq_api_key,
+        )
+
+    logger.info(
+        f"Using local Ollama model: {selected_model}"
+    )
+
+    return ChatOllama(
+        model=selected_model,
+        temperature=0,
+    )
+
+
+# ============================================================
 # MODEL NAMES
 # ============================================================
 
-def extract_model_names(models_info: Any) -> Tuple[str, ...]:
+def extract_model_names(
+    models_info: Any
+) -> Tuple[str, ...]:
     """
     Extract available Ollama model names.
     """
 
-    logger.info("Extracting model names from models_info")
+    logger.info(
+        "Extracting model names from Ollama"
+    )
 
     try:
+
         if hasattr(models_info, "models"):
+
             model_names = tuple(
-                model.model for model in models_info.models
+                model.model
+                for model in models_info.models
             )
+
         else:
+
             model_names = tuple()
 
         logger.info(
-            f"Extracted model names: {model_names}"
+            f"Available Ollama models: {model_names}"
         )
 
         return model_names
 
     except Exception as e:
+
         logger.error(
             f"Error extracting model names: {e}"
         )
@@ -119,20 +209,16 @@ def extract_pdf_documents(
     file_name: str
 ) -> Tuple[List[Document], int]:
     """
-    Extract text from a PDF.
+    Extract text from PDF.
 
-    First tries normal text extraction using PyMuPDF.
+    First tries normal PyMuPDF text extraction.
 
     If a page contains no readable text,
-    automatically uses OCR with Tesseract.
-
-    Returns:
-        documents
-        page_count
+    OCR using Tesseract is attempted.
     """
 
     logger.info(
-        f"Starting PDF extraction for: {file_name}"
+        f"Starting PDF extraction: {file_name}"
     )
 
     pdf = fitz.open(path)
@@ -141,22 +227,21 @@ def extract_pdf_documents(
 
     documents = []
 
-    # --------------------------------------------------------
-    # Process every page
-    # --------------------------------------------------------
-
     for page_number, page in enumerate(pdf):
 
-        page_text = page.get_text("text").strip()
+        page_text = page.get_text(
+            "text"
+        ).strip()
 
         # ----------------------------------------------------
-        # NORMAL TEXT PDF
+        # NORMAL TEXT
         # ----------------------------------------------------
 
         if page_text:
 
             logger.info(
-                f"Page {page_number + 1}: normal text detected"
+                f"Page {page_number + 1}: "
+                f"normal text detected"
             )
 
             documents.append(
@@ -165,8 +250,8 @@ def extract_pdf_documents(
                     metadata={
                         "page": page_number + 1,
                         "pdf_name": file_name,
-                        "extraction_method": "text"
-                    }
+                        "extraction_method": "text",
+                    },
                 )
             )
 
@@ -177,38 +262,39 @@ def extract_pdf_documents(
         # ----------------------------------------------------
 
         logger.info(
-            f"Page {page_number + 1}: no text found. "
-            f"Trying OCR..."
+            f"Page {page_number + 1}: "
+            f"no text found. Trying OCR..."
         )
 
         try:
 
             import pytesseract
-
             from PIL import Image
 
-            # Render page as image
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(2, 2),
-                alpha=False
+                alpha=False,
             )
 
-            image_bytes = pix.tobytes("png")
+            image_bytes = pix.tobytes(
+                "png"
+            )
 
             image = Image.open(
                 io.BytesIO(image_bytes)
             )
 
-            # OCR
-            ocr_text = pytesseract.image_to_string(
-                image
-            ).strip()
+            ocr_text = (
+                pytesseract
+                .image_to_string(image)
+                .strip()
+            )
 
             if ocr_text:
 
                 logger.info(
-                    f"OCR successfully extracted text "
-                    f"from page {page_number + 1}"
+                    f"OCR succeeded on page "
+                    f"{page_number + 1}"
                 )
 
                 documents.append(
@@ -217,16 +303,16 @@ def extract_pdf_documents(
                         metadata={
                             "page": page_number + 1,
                             "pdf_name": file_name,
-                            "extraction_method": "OCR"
-                        }
+                            "extraction_method": "OCR",
+                        },
                     )
                 )
 
             else:
 
                 logger.warning(
-                    f"OCR found no readable text "
-                    f"on page {page_number + 1}"
+                    f"OCR found no text on page "
+                    f"{page_number + 1}"
                 )
 
         except ImportError:
@@ -249,11 +335,36 @@ def extract_pdf_documents(
     pdf.close()
 
     logger.info(
-        f"PDF extraction completed: "
-        f"{len(documents)} readable pages"
+        f"PDF extraction completed. "
+        f"Readable pages: {len(documents)}"
     )
 
     return documents, page_count
+
+
+# ============================================================
+# CHUNK DOCUMENTS
+# ============================================================
+
+def split_documents(
+    documents: List[Document]
+) -> List[Document]:
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=7500,
+        chunk_overlap=100,
+    )
+
+    chunks = (
+        text_splitter
+        .split_documents(documents)
+    )
+
+    logger.info(
+        f"Created {len(chunks)} chunks"
+    )
+
+    return chunks
 
 
 # ============================================================
@@ -263,7 +374,7 @@ def extract_pdf_documents(
 def create_vector_db(file_upload) -> Chroma:
 
     logger.info(
-        f"Creating vector DB from: "
+        f"Creating vector database for "
         f"{file_upload.name}"
     )
 
@@ -273,50 +384,29 @@ def create_vector_db(file_upload) -> Chroma:
 
         path = os.path.join(
             temp_dir,
-            file_upload.name
+            file_upload.name,
         )
 
-        # Save PDF
         with open(path, "wb") as f:
-            f.write(file_upload.getvalue())
 
-        logger.info(
-            f"File saved to temporary path: {path}"
-        )
-
-        # ----------------------------------------------------
-        # Extract text / OCR
-        # ----------------------------------------------------
+            f.write(
+                file_upload.getvalue()
+            )
 
         data, _ = extract_pdf_documents(
             path,
-            file_upload.name
+            file_upload.name,
         )
 
         if not data:
 
             raise ValueError(
                 f"No readable text could be extracted "
-                f"from {file_upload.name}. "
-                f"OCR also found no readable text."
+                f"from {file_upload.name}."
             )
 
-        # ----------------------------------------------------
-        # Chunking
-        # ----------------------------------------------------
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=7500,
-            chunk_overlap=100
-        )
-
-        chunks = text_splitter.split_documents(
+        chunks = split_documents(
             data
-        )
-
-        logger.info(
-            f"Document split into "
-            f"{len(chunks)} chunks"
         )
 
         if not chunks:
@@ -326,41 +416,31 @@ def create_vector_db(file_upload) -> Chroma:
                 f"from {file_upload.name}."
             )
 
-        # ----------------------------------------------------
-        # Embedding model
-        # ----------------------------------------------------
-
-        embeddings = OllamaEmbeddings(
-            model="nomic-embed-text:latest"
-        )
+        embeddings = get_embeddings()
 
         texts = [
             chunk.page_content
             for chunk in chunks
         ]
 
-        # Generate embeddings explicitly
-        embedding_vectors = (
-            embeddings.embed_documents(texts)
+        logger.info(
+            "Generating embeddings..."
         )
 
-        logger.info(
-            f"Generated {len(embedding_vectors)} "
-            f"embeddings"
+        embedding_vectors = (
+            embeddings
+            .embed_documents(texts)
         )
 
         if (
             not embedding_vectors
-            or len(embedding_vectors) != len(texts)
+            or len(embedding_vectors)
+            != len(texts)
         ):
 
             raise ValueError(
                 "Embedding generation failed."
             )
-
-        # ----------------------------------------------------
-        # ChromaDB
-        # ----------------------------------------------------
 
         collection_name = (
             f"pdf_{abs(hash(file_upload.name))}"
@@ -382,7 +462,7 @@ def create_vector_db(file_upload) -> Chroma:
         )
 
         logger.info(
-            "Vector DB created successfully"
+            "Vector database created successfully"
         )
 
         return vector_db
@@ -391,15 +471,17 @@ def create_vector_db(file_upload) -> Chroma:
 
         shutil.rmtree(
             temp_dir,
-            ignore_errors=True
+            ignore_errors=True,
         )
 
 
 # ============================================================
-# PDF ID
+# GENERATE PDF ID
 # ============================================================
 
-def generate_pdf_id(file_upload) -> str:
+def generate_pdf_id(
+    file_upload
+) -> str:
 
     timestamp = datetime.now().isoformat()
 
@@ -416,12 +498,11 @@ def generate_pdf_id(file_upload) -> str:
 def process_and_store_pdf(
     file_upload,
     pdf_id: str,
-    is_sample: bool = False
+    is_sample: bool = False,
 ):
 
     logger.info(
-        f"Processing PDF: "
-        f"{file_upload.name}"
+        f"Processing PDF: {file_upload.name}"
     )
 
     temp_dir = tempfile.mkdtemp()
@@ -430,31 +511,21 @@ def process_and_store_pdf(
 
         path = os.path.join(
             temp_dir,
-            file_upload.name
+            file_upload.name,
         )
 
-        # ----------------------------------------------------
-        # Save PDF
-        # ----------------------------------------------------
-
-        file_bytes = file_upload.getvalue()
+        file_bytes = (
+            file_upload.getvalue()
+        )
 
         with open(path, "wb") as f:
 
             f.write(file_bytes)
 
-        logger.info(
-            f"File saved to: {path}"
-        )
-
-        # ----------------------------------------------------
-        # Extract text + OCR
-        # ----------------------------------------------------
-
         data, page_count = (
             extract_pdf_documents(
                 path,
-                file_upload.name
+                file_upload.name,
             )
         )
 
@@ -462,63 +533,39 @@ def process_and_store_pdf(
 
             raise ValueError(
                 f"No readable text could be extracted "
-                f"from {file_upload.name}. "
-                f"OCR also found no readable text."
+                f"from {file_upload.name}."
             )
 
-        # ----------------------------------------------------
-        # Chunking
-        # ----------------------------------------------------
-
-        text_splitter = (
-            RecursiveCharacterTextSplitter(
-                chunk_size=7500,
-                chunk_overlap=100
-            )
-        )
-
-        chunks = (
-            text_splitter.split_documents(
-                data
-            )
-        )
-
-        logger.info(
-            f"Created {len(chunks)} chunks"
+        chunks = split_documents(
+            data
         )
 
         if not chunks:
 
             raise ValueError(
-                f"No text chunks were created "
-                f"from {file_upload.name}."
+                f"No text chunks were created."
             )
 
         # ----------------------------------------------------
-        # Add metadata
+        # Metadata
         # ----------------------------------------------------
 
         for i, chunk in enumerate(chunks):
 
-            chunk.metadata.update({
-
-                "pdf_id": pdf_id,
-
-                "pdf_name": file_upload.name,
-
-                "chunk_index": i,
-
-                "source_file": file_upload.name
-
-            })
+            chunk.metadata.update(
+                {
+                    "pdf_id": pdf_id,
+                    "pdf_name": file_upload.name,
+                    "chunk_index": i,
+                    "source_file": file_upload.name,
+                }
+            )
 
         # ----------------------------------------------------
         # Embeddings
         # ----------------------------------------------------
 
-        embeddings = OllamaEmbeddings(
-            model="nomic-embed-text:latest"
-        )
+        embeddings = get_embeddings()
 
         texts = [
             chunk.page_content
@@ -530,19 +577,14 @@ def process_and_store_pdf(
         )
 
         embedding_vectors = (
-            embeddings.embed_documents(
-                texts
-            )
-        )
-
-        logger.info(
-            f"Generated "
-            f"{len(embedding_vectors)} embeddings"
+            embeddings
+            .embed_documents(texts)
         )
 
         if (
             not embedding_vectors
-            or len(embedding_vectors) != len(texts)
+            or len(embedding_vectors)
+            != len(texts)
         ):
 
             raise ValueError(
@@ -551,17 +593,12 @@ def process_and_store_pdf(
             )
 
         # ----------------------------------------------------
-        # ChromaDB
+        # Chroma
         # ----------------------------------------------------
 
         collection_name = (
             f"pdf_"
             f"{abs(hash(file_upload.name + pdf_id))}"
-        )
-
-        logger.info(
-            f"Creating Chroma collection: "
-            f"{collection_name}"
         )
 
         vector_db = Chroma(
@@ -570,49 +607,29 @@ def process_and_store_pdf(
             persist_directory=PERSIST_DIRECTORY,
         )
 
-        # Explicitly insert embeddings
         vector_db.add_texts(
-
             texts=texts,
-
             metadatas=[
                 chunk.metadata
                 for chunk in chunks
             ],
-
-            embeddings=embedding_vectors
-
-        )
-
-        logger.info(
-            "Embeddings successfully stored "
-            "in ChromaDB"
+            embeddings=embedding_vectors,
         )
 
         # ----------------------------------------------------
-        # Store PDF in Streamlit session
+        # Store in session
         # ----------------------------------------------------
 
         st.session_state["pdfs"][pdf_id] = {
-
             "name": file_upload.name,
-
             "vector_db": vector_db,
-
             "page_count": page_count,
-
             "file_bytes": file_bytes,
-
             "file_upload": file_upload,
-
             "collection_name": collection_name,
-
             "upload_timestamp": datetime.now(),
-
             "doc_count": len(chunks),
-
-            "is_sample": is_sample
-
+            "is_sample": is_sample,
         }
 
         st.session_state[
@@ -628,7 +645,7 @@ def process_and_store_pdf(
 
         shutil.rmtree(
             temp_dir,
-            ignore_errors=True
+            ignore_errors=True,
         )
 
 
@@ -636,18 +653,18 @@ def process_and_store_pdf(
 # DELETE ONE PDF
 # ============================================================
 
-def delete_pdf(pdf_id: str):
+def delete_pdf(
+    pdf_id: str
+):
 
-    if pdf_id not in st.session_state["pdfs"]:
+    if pdf_id not in (
+        st.session_state["pdfs"]
+    ):
 
         return
 
     pdf_data = (
         st.session_state["pdfs"][pdf_id]
-    )
-
-    logger.info(
-        f"Deleting {pdf_data['name']}"
     )
 
     try:
@@ -666,9 +683,9 @@ def delete_pdf(pdf_id: str):
         "pdfs"
     ][pdf_id]
 
-    if pdf_id in st.session_state[
-        "active_pdfs"
-    ]:
+    if pdf_id in (
+        st.session_state["active_pdfs"]
+    ):
 
         st.session_state[
             "active_pdfs"
@@ -686,9 +703,7 @@ def delete_pdf(pdf_id: str):
 def delete_all_pdfs():
 
     for pdf_id in list(
-        st.session_state[
-            "pdfs"
-        ].keys()
+        st.session_state["pdfs"].keys()
     ):
 
         delete_pdf(pdf_id)
@@ -709,7 +724,7 @@ def delete_all_pdfs():
 def process_question_multi_pdf(
     question: str,
     pdfs_dict: Dict[str, Dict],
-    selected_model: str
+    selected_model: str,
 ) -> Tuple[str, List[Dict]]:
 
     logger.info(
@@ -722,17 +737,11 @@ def process_question_multi_pdf(
     # --------------------------------------------------------
 
     name_words = (
-
         "file name",
-
         "filename",
-
         "document name",
-
         "pdf name",
-
-        "name of this document"
-
+        "name of this document",
     )
 
     normalized_question = (
@@ -756,84 +765,70 @@ def process_question_multi_pdf(
 
             name = pdf_data.get(
                 "name",
-                "Unknown file"
+                "Unknown file",
             )
 
             return (
-
                 f"The uploaded document is "
                 f"**{name}**.\n\n"
                 f"Source: **{name}**",
-
-                [{
-                    "pdf_name": name,
-                    "pdf_id": pdf_id,
-                    "page": "N/A",
-                    "chunk_index": 0
-                }]
-
+                [
+                    {
+                        "pdf_name": name,
+                        "pdf_id": pdf_id,
+                        "page": "N/A",
+                        "chunk_index": 0,
+                    }
+                ],
             )
 
-        else:
-
-            names = [
-
-                pdf_data.get(
-                    "name",
-                    "Unknown file"
-                )
-
-                for pdf_data
-                in pdfs_dict.values()
-
-            ]
-
-            answer = (
-                "The uploaded documents are:\n\n"
-                +
-                "\n".join(
-                    f"- **{name}**"
-                    for name in names
-                )
+        names = [
+            pdf_data.get(
+                "name",
+                "Unknown file",
             )
+            for pdf_data
+            in pdfs_dict.values()
+        ]
 
-            sources = [
+        answer = (
+            "The uploaded documents are:\n\n"
+            +
+            "\n".join(
+                f"- **{name}**"
+                for name in names
+            )
+        )
 
-                {
-                    "pdf_name":
-                        pdf_data.get(
-                            "name",
-                            "Unknown file"
-                        ),
+        sources = [
+            {
+                "pdf_name":
+                    pdf_data.get(
+                        "name",
+                        "Unknown file",
+                    ),
+                "pdf_id": pdf_id,
+                "page": "N/A",
+                "chunk_index": 0,
+            }
+            for pdf_id, pdf_data
+            in pdfs_dict.items()
+        ]
 
-                    "pdf_id":
-                        pdf_id,
-
-                    "page": "N/A",
-
-                    "chunk_index": 0
-                }
-
-                for pdf_id, pdf_data
-                in pdfs_dict.items()
-
-            ]
-
-            return answer, sources
+        return answer, sources
 
     # --------------------------------------------------------
-    # Local LLM
+    # LLM
     # --------------------------------------------------------
 
-    llm = ChatOllama(
-        model=selected_model,
-        temperature=0
+    llm = get_llm(
+        selected_model
     )
 
     all_retrieved_docs = []
 
     # --------------------------------------------------------
-    # Search every PDF
+    # Retrieve from every PDF
     # --------------------------------------------------------
 
     for pdf_id, pdf_data in (
@@ -847,15 +842,16 @@ def process_question_multi_pdf(
         try:
 
             docs = (
-                vector_db.similarity_search(
+                vector_db
+                .similarity_search(
                     question,
-                    k=2
+                    k=2,
                 )
             )
 
             logger.info(
-                f"Retrieved "
-                f"{len(docs)} documents from "
+                f"Retrieved {len(docs)} "
+                f"chunks from "
                 f"{pdf_data['name']}"
             )
 
@@ -887,12 +883,9 @@ def process_question_multi_pdf(
     if not all_retrieved_docs:
 
         return (
-
             "I could not find relevant "
             "information in the uploaded PDF.",
-
-            []
-
+            [],
         )
 
     # --------------------------------------------------------
@@ -905,20 +898,18 @@ def process_question_multi_pdf(
 
         pdf_name = doc.metadata.get(
             "pdf_name",
-            "Unknown file"
+            "Unknown file",
         )
 
         page_number = doc.metadata.get(
             "page",
-            "Unknown page"
+            "Unknown page",
         )
 
         context_parts.append(
-
             f"[Source: {pdf_name}, "
             f"Page: {page_number}]\n"
             f"{doc.page_content}"
-
         )
 
     formatted_context = (
@@ -989,15 +980,14 @@ ANSWER:
 
     try:
 
-        response = chain.invoke({
-
-            "context":
-                formatted_context,
-
-            "question":
-                question
-
-        })
+        response = chain.invoke(
+            {
+                "context":
+                    formatted_context,
+                "question":
+                    question,
+            }
+        )
 
     except Exception as e:
 
@@ -1008,8 +998,7 @@ ANSWER:
         return (
             f"Sorry, I could not generate "
             f"an answer.\n\nError: {e}",
-
-            []
+            [],
         )
 
     # --------------------------------------------------------
@@ -1017,13 +1006,11 @@ ANSWER:
     # --------------------------------------------------------
 
     source_details = [
-
         {
-
             "pdf_name":
                 doc.metadata.get(
                     "pdf_name",
-                    "Unknown file"
+                    "Unknown file",
                 ),
 
             "pdf_id":
@@ -1034,23 +1021,24 @@ ANSWER:
             "page":
                 doc.metadata.get(
                     "page",
-                    "Unknown"
+                    "Unknown",
                 ),
 
             "chunk_index":
                 doc.metadata.get(
                     "chunk_index",
-                    0
-                )
-
+                    0,
+                ),
         }
 
         for doc
-        in all_retrieved_docs[:12]
-
+        in all_retrieved_docs[:4]
     ]
 
-    return response, source_details
+    return (
+        response,
+        source_details,
+    )
 
 
 # ============================================================
@@ -1069,17 +1057,17 @@ def delete_vector_db(
 
             st.session_state.pop(
                 "pdf_pages",
-                None
+                None,
             )
 
             st.session_state.pop(
                 "file_upload",
-                None
+                None,
             )
 
             st.session_state.pop(
                 "vector_db",
-                None
+                None,
             )
 
             st.success(
@@ -1110,20 +1098,46 @@ def main():
     st.subheader(
         "🧠 Secure PDF RAG Assistant",
         divider="gray",
-        anchor=False
+        anchor=False,
     )
 
     # --------------------------------------------------------
-    # Ollama models
+    # Model configuration
     # --------------------------------------------------------
 
-    models_info = ollama.list()
+    groq_api_key = os.getenv(
+        "GROQ_API_KEY"
+    )
 
-    available_models = (
-        extract_model_names(
-            models_info
+    if groq_api_key:
+
+        available_models = (
+            GROQ_MODEL,
         )
-    )
+
+    else:
+
+        try:
+
+            import ollama
+
+            models_info = (
+                ollama.list()
+            )
+
+            available_models = (
+                extract_model_names(
+                    models_info
+                )
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"Could not connect to Ollama: {e}"
+            )
+
+            available_models = ()
 
     # --------------------------------------------------------
     # Layout
@@ -1137,31 +1151,41 @@ def main():
     # Session state
     # --------------------------------------------------------
 
-    if "messages" not in st.session_state:
+    if "messages" not in (
+        st.session_state
+    ):
 
         st.session_state[
             "messages"
         ] = []
 
-    if "pdfs" not in st.session_state:
+    if "pdfs" not in (
+        st.session_state
+    ):
 
         st.session_state[
             "pdfs"
         ] = {}
 
-    if "active_pdfs" not in st.session_state:
+    if "active_pdfs" not in (
+        st.session_state
+    ):
 
         st.session_state[
             "active_pdfs"
         ] = []
 
-    if "vector_db" not in st.session_state:
+    if "vector_db" not in (
+        st.session_state
+    ):
 
         st.session_state[
             "vector_db"
         ] = None
 
-    if "use_sample" not in st.session_state:
+    if "use_sample" not in (
+        st.session_state
+    ):
 
         st.session_state[
             "use_sample"
@@ -1171,27 +1195,34 @@ def main():
     # Model selector
     # --------------------------------------------------------
 
-    if available_models:
+    if groq_api_key:
+
+        selected_model = GROQ_MODEL
+
+        col2.success(
+            "☁️ Using Groq cloud model"
+        )
+
+    elif available_models:
 
         selected_model = (
             col2.selectbox(
-
                 "Pick a local Ollama model ↓",
-
                 available_models,
-
-                key="model_select"
-
+                key="model_select",
             )
         )
 
     else:
 
-        col2.error(
-            "No Ollama models found."
+        selected_model = (
+            OLLAMA_DEFAULT_MODEL
         )
 
-        return
+        col2.warning(
+            "Ollama is not available. "
+            "Add GROQ_API_KEY for cloud deployment."
+        )
 
     # ========================================================
     # SIDEBAR
@@ -1210,30 +1241,25 @@ def main():
         ):
 
             total_pdfs = len(
-                st.session_state[
-                    "pdfs"
-                ]
+                st.session_state["pdfs"]
             )
 
             total_chunks = sum(
-
                 pdf["doc_count"]
-
                 for pdf
                 in st.session_state[
                     "pdfs"
                 ].values()
-
             )
 
             st.metric(
                 "Total PDFs",
-                total_pdfs
+                total_pdfs,
             )
 
             st.metric(
                 "Total Chunks",
-                total_chunks
+                total_chunks,
             )
 
             st.divider()
@@ -1260,7 +1286,7 @@ def main():
 
                 with st.expander(
                     f"📄 {pdf_data['name']}",
-                    expanded=False
+                    expanded=False,
                 ):
 
                     st.caption(
@@ -1275,7 +1301,7 @@ def main():
 
                     if st.button(
                         "🗑️ Delete",
-                        key=f"delete_{pdf_id}"
+                        key=f"delete_{pdf_id}",
                     ):
 
                         delete_pdf(
@@ -1306,12 +1332,12 @@ def main():
 
     use_sample = col1.toggle(
         "Use sample PDF (Scammer Agent Paper)",
-        key="sample_checkbox"
+        key="sample_checkbox",
     )
 
-    # --------------------------------------------------------
-    # Upload PDFs
-    # --------------------------------------------------------
+    # ========================================================
+    # UPLOAD PDF
+    # ========================================================
 
     if use_sample:
 
@@ -1324,7 +1350,9 @@ def main():
             sample_id = "sample_pdf"
 
             if sample_id not in (
-                st.session_state["pdfs"]
+                st.session_state[
+                    "pdfs"
+                ]
             ):
 
                 with st.spinner(
@@ -1333,7 +1361,7 @@ def main():
 
                     with open(
                         sample_pdf_path,
-                        "rb"
+                        "rb",
                     ) as f:
 
                         file_bytes = f.read()
@@ -1343,7 +1371,7 @@ def main():
                         def __init__(
                             self,
                             path,
-                            content
+                            content,
                         ):
 
                             self.name = (
@@ -1354,23 +1382,21 @@ def main():
                                 content
                             )
 
-                        def getvalue(
-                            self
-                        ):
+                        def getvalue(self):
 
                             return self._content
 
                     sample_file = (
                         SampleFile(
                             sample_pdf_path,
-                            file_bytes
+                            file_bytes,
                         )
                     )
 
                     process_and_store_pdf(
                         sample_file,
                         sample_id,
-                        is_sample=True
+                        is_sample=True,
                     )
 
         else:
@@ -1381,25 +1407,20 @@ def main():
 
     else:
 
-        file_uploads = col1.file_uploader(
-
-            "Upload PDF files ↓",
-
-            type="pdf",
-
-            accept_multiple_files=True,
-
-            key="pdf_uploader"
-
+        file_uploads = (
+            col1.file_uploader(
+                "Upload PDF files ↓",
+                type="pdf",
+                accept_multiple_files=True,
+                key="pdf_uploader",
+            )
         )
-
-        # ----------------------------------------------------
-        # Process multiple PDFs
-        # ----------------------------------------------------
 
         if file_uploads:
 
-            for file_upload in file_uploads:
+            for file_upload in (
+                file_uploads
+            ):
 
                 pdf_id = (
                     generate_pdf_id(
@@ -1420,7 +1441,7 @@ def main():
 
                         process_and_store_pdf(
                             file_upload,
-                            pdf_id
+                            pdf_id,
                         )
 
     # ========================================================
@@ -1428,40 +1449,27 @@ def main():
     # ========================================================
 
     if (
-
-        st.session_state.get(
-            "pdfs"
-        )
-
+        st.session_state.get("pdfs")
         and
-
         st.session_state.get(
             "active_pdfs"
         )
-
     ):
 
         zoom_level = col1.slider(
-
             "Zoom Level",
-
             min_value=100,
-
             max_value=1000,
-
             value=700,
-
             step=50,
-
-            key="zoom_slider"
-
+            key="zoom_slider",
         )
 
         with col1:
 
             with st.container(
                 height=410,
-                border=True
+                border=True,
             ):
 
                 for pdf_id in (
@@ -1490,19 +1498,17 @@ def main():
                     )
 
                     st.caption(
-
                         f"Uploaded: "
                         f"{pdf_data['upload_timestamp'].strftime('%Y-%m-%d %H:%M')} "
                         f"| Chunks: "
                         f"{pdf_data['doc_count']} "
                         f"| Pages: "
                         f"{pdf_data['page_count']}"
-
                     )
 
                     if st.button(
                         "🗑️ Remove",
-                        key=f"remove_{pdf_id}"
+                        key=f"remove_{pdf_id}",
                     ):
 
                         delete_pdf(
@@ -1514,13 +1520,10 @@ def main():
                     st.divider()
 
                     viewer_pdf = fitz.open(
-
                         stream=pdf_data[
                             "file_bytes"
                         ],
-
-                        filetype="pdf"
-
+                        filetype="pdf",
                     )
 
                     for page_idx, page in enumerate(
@@ -1536,25 +1539,24 @@ def main():
                             page.get_pixmap(
                                 matrix=fitz.Matrix(
                                     1.2,
-                                    1.2
+                                    1.2,
                                 ),
-                                alpha=False
+                                alpha=False,
                             )
                         )
 
                         st.image(
-
                             pixmap.tobytes(
                                 "png"
                             ),
-
-                            width=zoom_level
-
+                            width=zoom_level,
                         )
 
                     viewer_pdf.close()
 
-                    st.markdown("---")
+                    st.markdown(
+                        "---"
+                    )
 
     else:
 
@@ -1569,7 +1571,7 @@ def main():
     delete_collection = col1.button(
         "⚠️ Delete collection",
         type="secondary",
-        key="delete_button"
+        key="delete_button",
     )
 
     if delete_collection:
@@ -1586,9 +1588,11 @@ def main():
 
     with col2:
 
-        message_container = st.container(
-            height=500,
-            border=True
+        message_container = (
+            st.container(
+                height=500,
+                border=True,
+            )
         )
 
         # ----------------------------------------------------
@@ -1603,13 +1607,14 @@ def main():
 
             avatar = (
                 "🤖"
-                if message["role"] == "assistant"
+                if message["role"]
+                == "assistant"
                 else "😎"
             )
 
             with message_container.chat_message(
                 message["role"],
-                avatar=avatar
+                avatar=avatar,
             ):
 
                 st.markdown(
@@ -1620,8 +1625,7 @@ def main():
                     message["role"]
                     == "assistant"
                     and
-                    "sources"
-                    in message
+                    "sources" in message
                 ):
 
                     st.divider()
@@ -1633,14 +1637,12 @@ def main():
                     sources_by_pdf = {}
 
                     for src in (
-                        message[
-                            "sources"
-                        ]
+                        message["sources"]
                     ):
 
                         pdf_name = src.get(
                             "pdf_name",
-                            "Unknown"
+                            "Unknown",
                         )
 
                         if pdf_name not in (
@@ -1655,7 +1657,10 @@ def main():
                             pdf_name
                         ] += 1
 
-                    for pdf_name, count in (
+                    for (
+                        pdf_name,
+                        count
+                    ) in (
                         sources_by_pdf.items()
                     ):
 
@@ -1668,25 +1673,26 @@ def main():
         # User question
         # ----------------------------------------------------
 
-        if prompt := st.chat_input(
+        prompt = st.chat_input(
             "Ask a question about your PDFs..."
-        ):
+        )
+
+        if prompt:
 
             try:
 
                 st.session_state[
                     "messages"
-                ].append({
-
-                    "role": "user",
-
-                    "content": prompt
-
-                })
+                ].append(
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                )
 
                 with message_container.chat_message(
                     "user",
-                    avatar="😎"
+                    avatar="😎",
                 ):
 
                     st.markdown(
@@ -1699,7 +1705,7 @@ def main():
 
                 with message_container.chat_message(
                     "assistant",
-                    avatar="🤖"
+                    avatar="🤖",
                 ):
 
                     with st.spinner(
@@ -1712,18 +1718,14 @@ def main():
 
                             (
                                 response,
-                                sources
+                                sources,
                             ) = (
                                 process_question_multi_pdf(
-
                                     prompt,
-
                                     st.session_state[
                                         "pdfs"
                                     ],
-
-                                    selected_model
-
+                                    selected_model,
                                 )
                             )
 
@@ -1746,7 +1748,7 @@ def main():
                                     pdf_name = (
                                         src.get(
                                             "pdf_name",
-                                            "Unknown"
+                                            "Unknown",
                                         )
                                     )
 
@@ -1764,7 +1766,7 @@ def main():
 
                                 for (
                                     pdf_name,
-                                    count
+                                    count,
                                 ) in (
                                     sources_by_pdf.items()
                                 ):
@@ -1782,7 +1784,6 @@ def main():
                             )
 
                             response = None
-
                             sources = None
 
                 # ------------------------------------------------
@@ -1793,24 +1794,19 @@ def main():
 
                     st.session_state[
                         "messages"
-                    ].append({
-
-                        "role":
-                            "assistant",
-
-                        "content":
-                            response,
-
-                        "sources":
-                            sources
-
-                    })
+                    ].append(
+                        {
+                            "role": "assistant",
+                            "content": response,
+                            "sources": sources,
+                        }
+                    )
 
             except Exception as e:
 
                 st.error(
                     e,
-                    icon="⛔"
+                    icon="⛔",
                 )
 
                 logger.error(
@@ -1834,5 +1830,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()

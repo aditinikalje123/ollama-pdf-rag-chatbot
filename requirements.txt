@@ -20,3 +20,5 @@ coverage==7.4.0
 pydantic==2.10.4
 langchain-groq>=1.0.0
 PyMuPDF
+langchain-huggingface
+sentence-transformers

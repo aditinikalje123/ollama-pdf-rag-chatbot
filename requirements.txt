@@ -9,8 +9,6 @@ langchain_community>=0.4.1
 langchain_text_splitters==1.0.0
 langchain-classic==1.0.0
 langchain-chroma>=0.2.0
-unstructured>=0.16.12
-unstructured[all-docs]>=0.16.12
 onnx>=1.17.0
 protobuf>=5.29.5
 chromadb>=0.4.22

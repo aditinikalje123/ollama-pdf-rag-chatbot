@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
-import fitz
+import pymupdf
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -221,7 +221,7 @@ def extract_pdf_documents(
         f"Starting PDF extraction: {file_name}"
     )
 
-    pdf = fitz.open(path)
+    pdf = pymupdf.open(path)
 
     page_count = len(pdf)
 
@@ -272,7 +272,7 @@ def extract_pdf_documents(
             from PIL import Image
 
             pix = page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
+                matrix=pymupdf.Matrix(2, 2),
                 alpha=False,
             )
 
@@ -1519,7 +1519,7 @@ def main():
 
                     st.divider()
 
-                    viewer_pdf = fitz.open(
+                    viewer_pdf = pymupdf.open(
                         stream=pdf_data[
                             "file_bytes"
                         ],
@@ -1537,7 +1537,7 @@ def main():
 
                         pixmap = (
                             page.get_pixmap(
-                                matrix=fitz.Matrix(
+                                matrix=pymupdf.Matrix(
                                     1.2,
                                     1.2,
                                 ),

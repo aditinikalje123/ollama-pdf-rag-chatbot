@@ -12,6 +12,7 @@ Features:
 - Groq cloud LLM when GROQ_API_KEY is available
 - Source filename and page numbers
 - PDF viewer
+- Render-friendly lazy loading and caching
 """
 
 import streamlit as st
@@ -34,11 +35,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from langchain_ollama import OllamaEmbeddings
-from langchain_ollama import ChatOllama
-
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
 
 
 # ============================================================
@@ -56,7 +53,9 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 PERSIST_DIRECTORY = os.path.join("data", "vectors")
 
 GROQ_MODEL = "openai/gpt-oss-20b"
+
 OLLAMA_EMBEDDING_MODEL = "nomic-embed-text:latest"
+
 OLLAMA_DEFAULT_MODEL = "llama3.2:3b"
 
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -88,26 +87,43 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# MODEL HELPERS
+# ENVIRONMENT
 # ============================================================
 
 def using_groq() -> bool:
-    """Return True when a Groq API key is available."""
+    """
+    Return True when GROQ_API_KEY is available.
+    """
+
     return bool(os.getenv("GROQ_API_KEY"))
 
 
+# ============================================================
+# EMBEDDINGS
+# ============================================================
+
+@st.cache_resource
 def get_embeddings():
     """
-    Use HuggingFace embeddings on Render/Groq deployment.
+    Create the embedding model only when it is actually needed.
 
-    Use Ollama embeddings locally when GROQ_API_KEY
-    is not available.
+    Cloud / Render:
+        HuggingFace embeddings
+
+    Local:
+        Ollama embeddings
     """
 
     if using_groq():
+
         logger.info(
-            "Using HuggingFace embeddings for cloud deployment"
+            "Initializing HuggingFace embeddings for cloud deployment"
         )
+
+        # Lazy import:
+        # This prevents the HuggingFace stack from loading
+        # just to display the Streamlit page.
+        from langchain_huggingface import HuggingFaceEmbeddings
 
         return HuggingFaceEmbeddings(
             model_name=HF_EMBEDDING_MODEL,
@@ -120,25 +136,36 @@ def get_embeddings():
         )
 
     logger.info(
-        "Using local Ollama embeddings"
+        "Initializing local Ollama embeddings"
     )
+
+    from langchain_ollama import OllamaEmbeddings
 
     return OllamaEmbeddings(
         model=OLLAMA_EMBEDDING_MODEL
     )
 
 
+# ============================================================
+# LLM
+# ============================================================
+
+@st.cache_resource
 def get_llm(selected_model: str):
     """
-    Return Groq LLM when deployed with GROQ_API_KEY.
+    Return Groq LLM when GROQ_API_KEY exists.
+
     Otherwise return local Ollama LLM.
     """
 
-    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_api_key = os.getenv(
+        "GROQ_API_KEY"
+    )
 
     if groq_api_key:
+
         logger.info(
-            f"Using Groq model: {GROQ_MODEL}"
+            f"Initializing Groq model: {GROQ_MODEL}"
         )
 
         return ChatGroq(
@@ -148,8 +175,10 @@ def get_llm(selected_model: str):
         )
 
     logger.info(
-        f"Using local Ollama model: {selected_model}"
+        f"Initializing local Ollama model: {selected_model}"
     )
+
+    from langchain_ollama import ChatOllama
 
     return ChatOllama(
         model=selected_model,
@@ -158,7 +187,7 @@ def get_llm(selected_model: str):
 
 
 # ============================================================
-# MODEL NAMES
+# OLLAMA MODEL NAMES
 # ============================================================
 
 def extract_model_names(
@@ -168,13 +197,12 @@ def extract_model_names(
     Extract available Ollama model names.
     """
 
-    logger.info(
-        "Extracting model names from Ollama"
-    )
-
     try:
 
-        if hasattr(models_info, "models"):
+        if hasattr(
+            models_info,
+            "models"
+        ):
 
             model_names = tuple(
                 model.model
@@ -194,7 +222,7 @@ def extract_model_names(
     except Exception as e:
 
         logger.error(
-            f"Error extracting model names: {e}"
+            f"Error extracting Ollama model names: {e}"
         )
 
         return tuple()
@@ -211,7 +239,7 @@ def extract_pdf_documents(
     """
     Extract text from PDF.
 
-    First tries normal PyMuPDF text extraction.
+    First uses PyMuPDF text extraction.
 
     If a page contains no readable text,
     OCR using Tesseract is attempted.
@@ -234,14 +262,13 @@ def extract_pdf_documents(
         ).strip()
 
         # ----------------------------------------------------
-        # NORMAL TEXT
+        # NORMAL TEXT PDF
         # ----------------------------------------------------
 
         if page_text:
 
             logger.info(
-                f"Page {page_number + 1}: "
-                f"normal text detected"
+                f"Page {page_number + 1}: normal text detected"
             )
 
             documents.append(
@@ -272,7 +299,10 @@ def extract_pdf_documents(
             from PIL import Image
 
             pix = page.get_pixmap(
-                matrix=pymupdf.Matrix(2, 2),
+                matrix=pymupdf.Matrix(
+                    2,
+                    2
+                ),
                 alpha=False,
             )
 
@@ -371,7 +401,9 @@ def split_documents(
 # CREATE VECTOR DATABASE
 # ============================================================
 
-def create_vector_db(file_upload) -> Chroma:
+def create_vector_db(
+    file_upload
+) -> Chroma:
 
     logger.info(
         f"Creating vector database for "
@@ -387,7 +419,10 @@ def create_vector_db(file_upload) -> Chroma:
             file_upload.name,
         )
 
-        with open(path, "wb") as f:
+        with open(
+            path,
+            "wb"
+        ) as f:
 
             f.write(
                 file_upload.getvalue()
@@ -518,9 +553,16 @@ def process_and_store_pdf(
             file_upload.getvalue()
         )
 
-        with open(path, "wb") as f:
+        with open(
+            path,
+            "wb"
+        ) as f:
 
             f.write(file_bytes)
+
+        # ----------------------------------------------------
+        # Extract text
+        # ----------------------------------------------------
 
         data, page_count = (
             extract_pdf_documents(
@@ -536,6 +578,10 @@ def process_and_store_pdf(
                 f"from {file_upload.name}."
             )
 
+        # ----------------------------------------------------
+        # Split into chunks
+        # ----------------------------------------------------
+
         chunks = split_documents(
             data
         )
@@ -543,11 +589,11 @@ def process_and_store_pdf(
         if not chunks:
 
             raise ValueError(
-                f"No text chunks were created."
+                "No text chunks were created."
             )
 
         # ----------------------------------------------------
-        # Metadata
+        # Add metadata
         # ----------------------------------------------------
 
         for i, chunk in enumerate(chunks):
@@ -593,7 +639,7 @@ def process_and_store_pdf(
             )
 
         # ----------------------------------------------------
-        # Chroma
+        # ChromaDB
         # ----------------------------------------------------
 
         collection_name = (
@@ -617,7 +663,7 @@ def process_and_store_pdf(
         )
 
         # ----------------------------------------------------
-        # Store in session
+        # Store in Streamlit session
         # ----------------------------------------------------
 
         st.session_state["pdfs"][pdf_id] = {
@@ -660,24 +706,27 @@ def delete_pdf(
     if pdf_id not in (
         st.session_state["pdfs"]
     ):
-
         return
 
     pdf_data = (
         st.session_state["pdfs"][pdf_id]
     )
 
-    try:
+    vector_db = (
+        pdf_data.get("vector_db")
+    )
 
-        pdf_data[
-            "vector_db"
-        ].delete_collection()
+    if vector_db is not None:
 
-    except Exception as e:
+        try:
 
-        logger.error(
-            f"Error deleting collection: {e}"
-        )
+            vector_db.delete_collection()
+
+        except Exception as e:
+
+            logger.error(
+                f"Error deleting vector collection: {e}"
+            )
 
     del st.session_state[
         "pdfs"
@@ -706,7 +755,9 @@ def delete_all_pdfs():
         st.session_state["pdfs"].keys()
     ):
 
-        delete_pdf(pdf_id)
+        delete_pdf(
+            pdf_id
+        )
 
     st.session_state[
         "pdfs"
@@ -850,9 +901,8 @@ def process_question_multi_pdf(
             )
 
             logger.info(
-                f"Retrieved {len(docs)} "
-                f"chunks from "
-                f"{pdf_data['name']}"
+                f"Retrieved {len(docs)} chunks "
+                f"from {pdf_data['name']}"
             )
 
             for doc in docs:
@@ -984,6 +1034,7 @@ ANSWER:
             {
                 "context":
                     formatted_context,
+
                 "question":
                     question,
             }
@@ -1042,7 +1093,7 @@ ANSWER:
 
 
 # ============================================================
-# DELETE VECTOR DB
+# DELETE VECTOR DATABASE
 # ============================================================
 
 def delete_vector_db(
@@ -1057,17 +1108,17 @@ def delete_vector_db(
 
             st.session_state.pop(
                 "pdf_pages",
-                None,
+                None
             )
 
             st.session_state.pop(
                 "file_upload",
-                None,
+                None
             )
 
             st.session_state.pop(
                 "vector_db",
-                None,
+                None
             )
 
             st.success(
@@ -1102,6 +1153,34 @@ def main():
     )
 
     # --------------------------------------------------------
+    # Session state
+    # --------------------------------------------------------
+
+    if "messages" not in st.session_state:
+
+        st.session_state[
+            "messages"
+        ] = []
+
+    if "pdfs" not in st.session_state:
+
+        st.session_state[
+            "pdfs"
+        ] = {}
+
+    if "active_pdfs" not in st.session_state:
+
+        st.session_state[
+            "active_pdfs"
+        ] = []
+
+    if "vector_db" not in st.session_state:
+
+        st.session_state[
+            "vector_db"
+        ] = None
+
+    # --------------------------------------------------------
     # Model configuration
     # --------------------------------------------------------
 
@@ -1119,6 +1198,8 @@ def main():
 
         try:
 
+            # Lazy import:
+            # Ollama is only needed locally.
             import ollama
 
             models_info = (
@@ -1146,50 +1227,6 @@ def main():
     col1, col2 = st.columns(
         [1.5, 2]
     )
-
-    # --------------------------------------------------------
-    # Session state
-    # --------------------------------------------------------
-
-    if "messages" not in (
-        st.session_state
-    ):
-
-        st.session_state[
-            "messages"
-        ] = []
-
-    if "pdfs" not in (
-        st.session_state
-    ):
-
-        st.session_state[
-            "pdfs"
-        ] = {}
-
-    if "active_pdfs" not in (
-        st.session_state
-    ):
-
-        st.session_state[
-            "active_pdfs"
-        ] = []
-
-    if "vector_db" not in (
-        st.session_state
-    ):
-
-        st.session_state[
-            "vector_db"
-        ] = None
-
-    if "use_sample" not in (
-        st.session_state
-    ):
-
-        st.session_state[
-            "use_sample"
-        ] = False
 
     # --------------------------------------------------------
     # Model selector
@@ -1236,9 +1273,7 @@ def main():
             "📚 Loaded PDFs"
         )
 
-        if st.session_state.get(
-            "pdfs"
-        ):
+        if st.session_state.get("pdfs"):
 
             total_pdfs = len(
                 st.session_state["pdfs"]
@@ -1418,9 +1453,7 @@ def main():
 
         if file_uploads:
 
-            for file_upload in (
-                file_uploads
-            ):
+            for file_upload in file_uploads:
 
                 pdf_id = (
                     generate_pdf_id(
@@ -1439,10 +1472,23 @@ def main():
                         f"{file_upload.name}..."
                     ):
 
-                        process_and_store_pdf(
-                            file_upload,
-                            pdf_id,
-                        )
+                        try:
+
+                            process_and_store_pdf(
+                                file_upload,
+                                pdf_id,
+                            )
+
+                        except Exception as e:
+
+                            st.error(
+                                f"Error processing "
+                                f"{file_upload.name}: {e}"
+                            )
+
+                            logger.error(
+                                f"PDF processing error: {e}"
+                            )
 
     # ========================================================
     # PDF VIEWER
@@ -1451,9 +1497,7 @@ def main():
     if (
         st.session_state.get("pdfs")
         and
-        st.session_state.get(
-            "active_pdfs"
-        )
+        st.session_state.get("active_pdfs")
     ):
 
         zoom_level = col1.slider(
@@ -1805,7 +1849,7 @@ def main():
             except Exception as e:
 
                 st.error(
-                    e,
+                    str(e),
                     icon="⛔",
                 )
 

@@ -1,748 +1,194 @@
 """
-Secure PDF RAG Assistant
+Secure PDF RAG Assistant - Lightweight Render Version
 
 Features:
 - Multiple PDF upload
-- Normal PDF text extraction using PyMuPDF
-- OCR fallback for scanned PDFs
-- Local Ollama embeddings when running locally
-- HuggingFace embeddings when deployed with Groq
-- ChromaDB vector database
-- Local Ollama LLM when running locally
-- Groq cloud LLM when GROQ_API_KEY is available
+- PDF text extraction using PyMuPDF
+- Lightweight TF-IDF retrieval
+- Groq cloud LLM
 - Source filename and page numbers
 - PDF viewer
-- Render-friendly lazy loading and caching
+- Fast Render deployment
 """
 
-import streamlit as st
-import logging
+import hashlib
 import os
-import tempfile
-import shutil
-import io
-import warnings
-
-from datetime import datetime
-from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+import re
 
 import pymupdf
-
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
-from langchain_groq import ChatGroq
+import requests
+import streamlit as st
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ============================================================
-# SETTINGS
+# CONFIGURATION
 # ============================================================
-
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    message=".*torch.classes.*"
-)
-
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
-PERSIST_DIRECTORY = os.path.join("data", "vectors")
 
 GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-OLLAMA_EMBEDDING_MODEL = "nomic-embed-text:latest"
-
-OLLAMA_DEFAULT_MODEL = "llama3.2:3b"
-
-HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+MAX_CONTEXT_CHUNKS = 5
+CHUNK_SIZE = 1800
+CHUNK_OVERLAP = 200
 
 
 # ============================================================
-# STREAMLIT CONFIG
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Secure PDF RAG Assistant",
-    page_icon="🤖",
+    page_icon="📄",
     layout="wide",
-    initial_sidebar_state="collapsed",
 )
 
 
 # ============================================================
-# LOGGING
+# SESSION STATE
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+if "pdfs" not in st.session_state:
+    st.session_state.pdfs = {}
 
-logger = logging.getLogger(__name__)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
-def using_groq() -> bool:
-    """
-    Return True when GROQ_API_KEY is available.
-    """
-
-    return bool(os.getenv("GROQ_API_KEY"))
+if "active_pdf_id" not in st.session_state:
+    st.session_state.active_pdf_id = None
 
 
 # ============================================================
-# EMBEDDINGS
+# PDF ID
 # ============================================================
 
-@st.cache_resource
-def get_embeddings():
-    """
-    Create the embedding model only when it is actually needed.
-
-    Cloud / Render:
-        HuggingFace embeddings
-
-    Local:
-        Ollama embeddings
-    """
-
-    if using_groq():
-
-        logger.info(
-            "Initializing HuggingFace embeddings for cloud deployment"
-        )
-
-        # Lazy import:
-        # This prevents the HuggingFace stack from loading
-        # just to display the Streamlit page.
-        from langchain_huggingface import HuggingFaceEmbeddings
-
-        return HuggingFaceEmbeddings(
-            model_name=HF_EMBEDDING_MODEL,
-            model_kwargs={
-                "device": "cpu"
-            },
-            encode_kwargs={
-                "normalize_embeddings": True
-            },
-        )
-
-    logger.info(
-        "Initializing local Ollama embeddings"
-    )
-
-    from langchain_ollama import OllamaEmbeddings
-
-    return OllamaEmbeddings(
-        model=OLLAMA_EMBEDDING_MODEL
-    )
+def generate_pdf_id(filename, pdf_bytes):
+    """Generate a unique ID for a PDF."""
+    content = filename.encode("utf-8") + pdf_bytes
+    return hashlib.md5(content).hexdigest()
 
 
 # ============================================================
-# LLM
+# TEXT CHUNKING
 # ============================================================
 
-@st.cache_resource
-def get_llm(selected_model: str):
-    """
-    Return Groq LLM when GROQ_API_KEY exists.
+def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split text into overlapping chunks."""
 
-    Otherwise return local Ollama LLM.
-    """
+    text = re.sub(r"\s+", " ", text).strip()
 
-    groq_api_key = os.getenv(
-        "GROQ_API_KEY"
-    )
+    if not text:
+        return []
 
-    if groq_api_key:
+    chunks = []
+    start = 0
 
-        logger.info(
-            f"Initializing Groq model: {GROQ_MODEL}"
-        )
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
 
-        return ChatGroq(
-            model=GROQ_MODEL,
-            temperature=0,
-            groq_api_key=groq_api_key,
-        )
+        if chunk:
+            chunks.append(chunk)
 
-    logger.info(
-        f"Initializing local Ollama model: {selected_model}"
-    )
+        if end >= len(text):
+            break
 
-    from langchain_ollama import ChatOllama
-
-    return ChatOllama(
-        model=selected_model,
-        temperature=0,
-    )
-
-
-# ============================================================
-# OLLAMA MODEL NAMES
-# ============================================================
-
-def extract_model_names(
-    models_info: Any
-) -> Tuple[str, ...]:
-    """
-    Extract available Ollama model names.
-    """
-
-    try:
-
-        if hasattr(
-            models_info,
-            "models"
-        ):
-
-            model_names = tuple(
-                model.model
-                for model in models_info.models
-            )
-
-        else:
-
-            model_names = tuple()
-
-        logger.info(
-            f"Available Ollama models: {model_names}"
-        )
-
-        return model_names
-
-    except Exception as e:
-
-        logger.error(
-            f"Error extracting Ollama model names: {e}"
-        )
-
-        return tuple()
-
-
-# ============================================================
-# PDF TEXT + OCR EXTRACTION
-# ============================================================
-
-def extract_pdf_documents(
-    path: str,
-    file_name: str
-) -> Tuple[List[Document], int]:
-    """
-    Extract text from PDF.
-
-    First uses PyMuPDF text extraction.
-
-    If a page contains no readable text,
-    OCR using Tesseract is attempted.
-    """
-
-    logger.info(
-        f"Starting PDF extraction: {file_name}"
-    )
-
-    pdf = pymupdf.open(path)
-
-    page_count = len(pdf)
-
-    documents = []
-
-    for page_number, page in enumerate(pdf):
-
-        page_text = page.get_text(
-            "text"
-        ).strip()
-
-        # ----------------------------------------------------
-        # NORMAL TEXT PDF
-        # ----------------------------------------------------
-
-        if page_text:
-
-            logger.info(
-                f"Page {page_number + 1}: normal text detected"
-            )
-
-            documents.append(
-                Document(
-                    page_content=page_text,
-                    metadata={
-                        "page": page_number + 1,
-                        "pdf_name": file_name,
-                        "extraction_method": "text",
-                    },
-                )
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # OCR FALLBACK
-        # ----------------------------------------------------
-
-        logger.info(
-            f"Page {page_number + 1}: "
-            f"no text found. Trying OCR..."
-        )
-
-        try:
-
-            import pytesseract
-            from PIL import Image
-
-            pix = page.get_pixmap(
-                matrix=pymupdf.Matrix(
-                    2,
-                    2
-                ),
-                alpha=False,
-            )
-
-            image_bytes = pix.tobytes(
-                "png"
-            )
-
-            image = Image.open(
-                io.BytesIO(image_bytes)
-            )
-
-            ocr_text = (
-                pytesseract
-                .image_to_string(image)
-                .strip()
-            )
-
-            if ocr_text:
-
-                logger.info(
-                    f"OCR succeeded on page "
-                    f"{page_number + 1}"
-                )
-
-                documents.append(
-                    Document(
-                        page_content=ocr_text,
-                        metadata={
-                            "page": page_number + 1,
-                            "pdf_name": file_name,
-                            "extraction_method": "OCR",
-                        },
-                    )
-                )
-
-            else:
-
-                logger.warning(
-                    f"OCR found no text on page "
-                    f"{page_number + 1}"
-                )
-
-        except ImportError:
-
-            pdf.close()
-
-            raise RuntimeError(
-                "pytesseract is not installed.\n\n"
-                "Run:\n"
-                "pip install pytesseract"
-            )
-
-        except Exception as e:
-
-            logger.error(
-                f"OCR failed on page "
-                f"{page_number + 1}: {e}"
-            )
-
-    pdf.close()
-
-    logger.info(
-        f"PDF extraction completed. "
-        f"Readable pages: {len(documents)}"
-    )
-
-    return documents, page_count
-
-
-# ============================================================
-# CHUNK DOCUMENTS
-# ============================================================
-
-def split_documents(
-    documents: List[Document]
-) -> List[Document]:
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=7500,
-        chunk_overlap=100,
-    )
-
-    chunks = (
-        text_splitter
-        .split_documents(documents)
-    )
-
-    logger.info(
-        f"Created {len(chunks)} chunks"
-    )
+        start = end - overlap
 
     return chunks
 
 
 # ============================================================
-# CREATE VECTOR DATABASE
+# PDF EXTRACTION
 # ============================================================
 
-def create_vector_db(
-    file_upload
-) -> Chroma:
+def extract_pdf(pdf_bytes, filename):
+    """
+    Extract text from PDF page by page.
 
-    logger.info(
-        f"Creating vector database for "
-        f"{file_upload.name}"
-    )
+    Returns:
+        List of dictionaries containing:
+        - text
+        - page
+        - filename
+    """
 
-    temp_dir = tempfile.mkdtemp()
+    documents = []
 
     try:
+        pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
 
-        path = os.path.join(
-            temp_dir,
-            file_upload.name,
-        )
+        for page_number, page in enumerate(pdf, start=1):
+            text = page.get_text("text")
 
-        with open(
-            path,
-            "wb"
-        ) as f:
+            if not text.strip():
+                continue
 
-            f.write(
-                file_upload.getvalue()
-            )
+            chunks = split_text(text)
 
-        data, _ = extract_pdf_documents(
-            path,
-            file_upload.name,
-        )
+            for chunk in chunks:
+                documents.append(
+                    {
+                        "text": chunk,
+                        "page": page_number,
+                        "filename": filename,
+                    }
+                )
 
-        if not data:
+        pdf.close()
 
-            raise ValueError(
-                f"No readable text could be extracted "
-                f"from {file_upload.name}."
-            )
+    except Exception as e:
+        st.error(f"Error reading {filename}: {e}")
 
-        chunks = split_documents(
-            data
-        )
-
-        if not chunks:
-
-            raise ValueError(
-                f"No text chunks were created "
-                f"from {file_upload.name}."
-            )
-
-        embeddings = get_embeddings()
-
-        texts = [
-            chunk.page_content
-            for chunk in chunks
-        ]
-
-        logger.info(
-            "Generating embeddings..."
-        )
-
-        embedding_vectors = (
-            embeddings
-            .embed_documents(texts)
-        )
-
-        if (
-            not embedding_vectors
-            or len(embedding_vectors)
-            != len(texts)
-        ):
-
-            raise ValueError(
-                "Embedding generation failed."
-            )
-
-        collection_name = (
-            f"pdf_{abs(hash(file_upload.name))}"
-        )
-
-        vector_db = Chroma(
-            collection_name=collection_name,
-            embedding_function=embeddings,
-            persist_directory=PERSIST_DIRECTORY,
-        )
-
-        vector_db.add_texts(
-            texts=texts,
-            metadatas=[
-                chunk.metadata
-                for chunk in chunks
-            ],
-            embeddings=embedding_vectors,
-        )
-
-        logger.info(
-            "Vector database created successfully"
-        )
-
-        return vector_db
-
-    finally:
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
-        )
+    return documents
 
 
 # ============================================================
-# GENERATE PDF ID
+# PROCESS PDF
 # ============================================================
 
-def generate_pdf_id(
-    file_upload
-) -> str:
+def process_pdf(uploaded_file):
+    """Process and store uploaded PDF."""
 
-    timestamp = datetime.now().isoformat()
+    pdf_bytes = uploaded_file.getvalue()
+    filename = uploaded_file.name
 
-    return (
-        f"pdf_"
-        f"{abs(hash(file_upload.name + timestamp))}"
-    )
+    pdf_id = generate_pdf_id(filename, pdf_bytes)
 
+    if pdf_id in st.session_state.pdfs:
+        return pdf_id
 
-# ============================================================
-# PROCESS AND STORE PDF
-# ============================================================
+    documents = extract_pdf(pdf_bytes, filename)
 
-def process_and_store_pdf(
-    file_upload,
-    pdf_id: str,
-    is_sample: bool = False,
-):
-
-    logger.info(
-        f"Processing PDF: {file_upload.name}"
-    )
-
-    temp_dir = tempfile.mkdtemp()
-
-    try:
-
-        path = os.path.join(
-            temp_dir,
-            file_upload.name,
+    if not documents:
+        st.warning(
+            f"No readable text was found in '{filename}'. "
+            "This version works with text-based PDFs."
         )
+        return None
 
-        file_bytes = (
-            file_upload.getvalue()
-        )
+    st.session_state.pdfs[pdf_id] = {
+        "filename": filename,
+        "bytes": pdf_bytes,
+        "documents": documents,
+    }
 
-        with open(
-            path,
-            "wb"
-        ) as f:
-
-            f.write(file_bytes)
-
-        # ----------------------------------------------------
-        # Extract text
-        # ----------------------------------------------------
-
-        data, page_count = (
-            extract_pdf_documents(
-                path,
-                file_upload.name,
-            )
-        )
-
-        if not data:
-
-            raise ValueError(
-                f"No readable text could be extracted "
-                f"from {file_upload.name}."
-            )
-
-        # ----------------------------------------------------
-        # Split into chunks
-        # ----------------------------------------------------
-
-        chunks = split_documents(
-            data
-        )
-
-        if not chunks:
-
-            raise ValueError(
-                "No text chunks were created."
-            )
-
-        # ----------------------------------------------------
-        # Add metadata
-        # ----------------------------------------------------
-
-        for i, chunk in enumerate(chunks):
-
-            chunk.metadata.update(
-                {
-                    "pdf_id": pdf_id,
-                    "pdf_name": file_upload.name,
-                    "chunk_index": i,
-                    "source_file": file_upload.name,
-                }
-            )
-
-        # ----------------------------------------------------
-        # Embeddings
-        # ----------------------------------------------------
-
-        embeddings = get_embeddings()
-
-        texts = [
-            chunk.page_content
-            for chunk in chunks
-        ]
-
-        logger.info(
-            "Generating embeddings..."
-        )
-
-        embedding_vectors = (
-            embeddings
-            .embed_documents(texts)
-        )
-
-        if (
-            not embedding_vectors
-            or len(embedding_vectors)
-            != len(texts)
-        ):
-
-            raise ValueError(
-                f"Embedding generation failed "
-                f"for {file_upload.name}."
-            )
-
-        # ----------------------------------------------------
-        # ChromaDB
-        # ----------------------------------------------------
-
-        collection_name = (
-            f"pdf_"
-            f"{abs(hash(file_upload.name + pdf_id))}"
-        )
-
-        vector_db = Chroma(
-            collection_name=collection_name,
-            embedding_function=embeddings,
-            persist_directory=PERSIST_DIRECTORY,
-        )
-
-        vector_db.add_texts(
-            texts=texts,
-            metadatas=[
-                chunk.metadata
-                for chunk in chunks
-            ],
-            embeddings=embedding_vectors,
-        )
-
-        # ----------------------------------------------------
-        # Store in Streamlit session
-        # ----------------------------------------------------
-
-        st.session_state["pdfs"][pdf_id] = {
-            "name": file_upload.name,
-            "vector_db": vector_db,
-            "page_count": page_count,
-            "file_bytes": file_bytes,
-            "file_upload": file_upload,
-            "collection_name": collection_name,
-            "upload_timestamp": datetime.now(),
-            "doc_count": len(chunks),
-            "is_sample": is_sample,
-        }
-
-        st.session_state[
-            "active_pdfs"
-        ].append(pdf_id)
-
-        logger.info(
-            f"PDF stored successfully: "
-            f"{file_upload.name}"
-        )
-
-    finally:
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
-        )
+    return pdf_id
 
 
 # ============================================================
-# DELETE ONE PDF
+# DELETE PDF
 # ============================================================
 
-def delete_pdf(
-    pdf_id: str
-):
+def delete_pdf(pdf_id):
+    """Delete one PDF."""
 
-    if pdf_id not in (
-        st.session_state["pdfs"]
-    ):
-        return
+    if pdf_id in st.session_state.pdfs:
+        del st.session_state.pdfs[pdf_id]
 
-    pdf_data = (
-        st.session_state["pdfs"][pdf_id]
-    )
-
-    vector_db = (
-        pdf_data.get("vector_db")
-    )
-
-    if vector_db is not None:
-
-        try:
-
-            vector_db.delete_collection()
-
-        except Exception as e:
-
-            logger.error(
-                f"Error deleting vector collection: {e}"
-            )
-
-    del st.session_state[
-        "pdfs"
-    ][pdf_id]
-
-    if pdf_id in (
-        st.session_state["active_pdfs"]
-    ):
-
-        st.session_state[
-            "active_pdfs"
-        ].remove(pdf_id)
-
-    st.success(
-        f"Deleted {pdf_data['name']}"
-    )
+    if st.session_state.active_pdf_id == pdf_id:
+        st.session_state.active_pdf_id = None
 
 
 # ============================================================
@@ -750,191 +196,218 @@ def delete_pdf(
 # ============================================================
 
 def delete_all_pdfs():
+    """Delete all uploaded PDFs."""
 
-    for pdf_id in list(
-        st.session_state["pdfs"].keys()
-    ):
+    st.session_state.pdfs = {}
+    st.session_state.active_pdf_id = None
+    st.session_state.messages = []
 
-        delete_pdf(
-            pdf_id
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+def retrieve_documents(question, selected_pdf_ids):
+    """
+    Retrieve relevant document chunks using TF-IDF
+    and cosine similarity.
+    """
+
+    all_documents = []
+
+    for pdf_id in selected_pdf_ids:
+        pdf_data = st.session_state.pdfs.get(pdf_id)
+
+        if pdf_data:
+            all_documents.extend(pdf_data["documents"])
+
+    if not all_documents:
+        return []
+
+    texts = [doc["text"] for doc in all_documents]
+
+    try:
+        vectorizer = TfidfVectorizer(
+            stop_words="english",
+            max_features=5000,
         )
 
-    st.session_state[
-        "pdfs"
-    ] = {}
+        document_vectors = vectorizer.fit_transform(texts)
+        question_vector = vectorizer.transform([question])
 
-    st.session_state[
-        "active_pdfs"
-    ] = []
+        similarities = cosine_similarity(
+            question_vector,
+            document_vectors
+        )[0]
+
+    except Exception:
+        return all_documents[:MAX_CONTEXT_CHUNKS]
+
+    ranked_indexes = similarities.argsort()[::-1]
+
+    results = []
+
+    for index in ranked_indexes:
+        score = float(similarities[index])
+
+        if score <= 0:
+            continue
+
+        doc = all_documents[index].copy()
+        doc["score"] = score
+
+        results.append(doc)
+
+        if len(results) >= MAX_CONTEXT_CHUNKS:
+            break
+
+    return results
+
+
+# ============================================================
+# GROQ
+# ============================================================
+
+def ask_groq(question, context):
+    """Send question and retrieved context to Groq."""
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        return (
+            "GROQ_API_KEY is not configured. "
+            "Please add it to the Render Environment Variables."
+        )
+
+    prompt = f"""
+You are a secure company PDF question-answering assistant.
+
+Answer the user's question ONLY using the information provided
+in the PDF context below.
+
+If the answer is not present in the context, clearly say:
+"I could not find this information in the uploaded PDF."
+
+Do not invent facts.
+Keep the answer clear and concise.
+
+PDF CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+"""
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You answer questions using only the supplied "
+                    "PDF context."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.1,
+        "max_tokens": 700,
+    }
+
+    try:
+        response = requests.post(
+            GROQ_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+
+        if response.status_code != 200:
+            try:
+                error_data = response.json()
+                error_message = error_data.get(
+                    "error",
+                    {}
+                ).get(
+                    "message",
+                    response.text
+                )
+            except Exception:
+                error_message = response.text
+
+            return f"Groq API error: {error_message}"
+
+        data = response.json()
+
+        return data["choices"][0]["message"]["content"]
+
+    except requests.exceptions.Timeout:
+        return "The AI request timed out. Please try the question again."
+
+    except Exception as e:
+        return f"Error connecting to Groq: {e}"
 
 
 # ============================================================
 # QUESTION PROCESSING
 # ============================================================
 
-def process_question_multi_pdf(
-    question: str,
-    pdfs_dict: Dict[str, Dict],
-    selected_model: str,
-) -> Tuple[str, List[Dict]]:
+def process_question(question, selected_pdf_ids):
+    """Process user question."""
 
-    logger.info(
-        f"Processing question across "
-        f"{len(pdfs_dict)} PDFs: {question}"
-    )
+    if not selected_pdf_ids:
+        return "Please upload and select a PDF first.", []
 
     # --------------------------------------------------------
-    # Direct filename questions
+    # Check for filename-related questions
     # --------------------------------------------------------
 
-    name_words = (
+    filename_keywords = [
         "file name",
         "filename",
         "document name",
         "pdf name",
-        "name of this document",
-    )
+        "which file",
+        "which document",
+    ]
 
-    normalized_question = (
-        question.lower().strip()
-    )
+    question_lower = question.lower()
 
-    if any(
-        word in normalized_question
-        for word in name_words
-    ):
-
-        if len(pdfs_dict) == 1:
-
-            pdf_id = next(
-                iter(pdfs_dict)
-            )
-
-            pdf_data = (
-                pdfs_dict[pdf_id]
-            )
-
-            name = pdf_data.get(
-                "name",
-                "Unknown file",
-            )
-
-            return (
-                f"The uploaded document is "
-                f"**{name}**.\n\n"
-                f"Source: **{name}**",
-                [
-                    {
-                        "pdf_name": name,
-                        "pdf_id": pdf_id,
-                        "page": "N/A",
-                        "chunk_index": 0,
-                    }
-                ],
-            )
-
+    if any(keyword in question_lower for keyword in filename_keywords):
         names = [
-            pdf_data.get(
-                "name",
-                "Unknown file",
-            )
-            for pdf_data
-            in pdfs_dict.values()
+            st.session_state.pdfs[pdf_id]["filename"]
+            for pdf_id in selected_pdf_ids
+            if pdf_id in st.session_state.pdfs
         ]
 
-        answer = (
-            "The uploaded documents are:\n\n"
-            +
-            "\n".join(
-                f"- **{name}**"
-                for name in names
+        if names:
+            return (
+                "The uploaded PDF file(s) are:\n\n"
+                + "\n".join(f"- {name}" for name in names),
+                [],
             )
-        )
-
-        sources = [
-            {
-                "pdf_name":
-                    pdf_data.get(
-                        "name",
-                        "Unknown file",
-                    ),
-                "pdf_id": pdf_id,
-                "page": "N/A",
-                "chunk_index": 0,
-            }
-            for pdf_id, pdf_data
-            in pdfs_dict.items()
-        ]
-
-        return answer, sources
 
     # --------------------------------------------------------
-    # LLM
+    # Retrieve relevant chunks
     # --------------------------------------------------------
 
-    llm = get_llm(
-        selected_model
+    retrieved_docs = retrieve_documents(
+        question,
+        selected_pdf_ids,
     )
 
-    all_retrieved_docs = []
-
-    # --------------------------------------------------------
-    # Retrieve from every PDF
-    # --------------------------------------------------------
-
-    for pdf_id, pdf_data in (
-        pdfs_dict.items()
-    ):
-
-        vector_db = (
-            pdf_data["vector_db"]
-        )
-
-        try:
-
-            docs = (
-                vector_db
-                .similarity_search(
-                    question,
-                    k=2,
-                )
-            )
-
-            logger.info(
-                f"Retrieved {len(docs)} chunks "
-                f"from {pdf_data['name']}"
-            )
-
-            for doc in docs:
-
-                doc.metadata[
-                    "pdf_name"
-                ] = pdf_data["name"]
-
-                doc.metadata[
-                    "pdf_id"
-                ] = pdf_id
-
-            all_retrieved_docs.extend(
-                docs
-            )
-
-        except Exception as e:
-
-            logger.error(
-                f"Error retrieving from "
-                f"{pdf_data['name']}: {e}"
-            )
-
-    # --------------------------------------------------------
-    # No results
-    # --------------------------------------------------------
-
-    if not all_retrieved_docs:
-
+    if not retrieved_docs:
         return (
-            "I could not find relevant "
-            "information in the uploaded PDF.",
+            "I could not find relevant information in "
+            "the uploaded PDF.",
             [],
         )
 
@@ -944,199 +417,175 @@ def process_question_multi_pdf(
 
     context_parts = []
 
-    for doc in all_retrieved_docs[:4]:
-
-        pdf_name = doc.metadata.get(
-            "pdf_name",
-            "Unknown file",
-        )
-
-        page_number = doc.metadata.get(
-            "page",
-            "Unknown page",
-        )
-
+    for doc in retrieved_docs:
         context_parts.append(
-            f"[Source: {pdf_name}, "
-            f"Page: {page_number}]\n"
-            f"{doc.page_content}"
-        )
+            f"""
+Source: {doc['filename']}
+Page: {doc['page']}
 
-    formatted_context = (
-        "\n\n---\n\n".join(
-            context_parts
-        )
-    )
-
-    # --------------------------------------------------------
-    # RAG Prompt
-    # --------------------------------------------------------
-
-    template = """
-You are a secure document question-answering assistant.
-
-Answer the user's question using ONLY
-the information provided in the PDF context.
-
-Rules:
-
-1. Do not use outside knowledge.
-
-2. Do not invent information.
-
-3. If the answer is not present,
-say:
-
-"I could not find this information
-in the uploaded document."
-
-4. If multiple PDFs are provided,
-use the correct PDF information.
-
-5. Give a short and direct answer.
-
-6. Mention the relevant source
-filename and page number.
-
-7. If the user asks for a comparison,
-compare only information available
-in the provided PDFs.
-
-PDF CONTEXT:
-
-{context}
-
-USER QUESTION:
-
-{question}
-
-ANSWER:
+{doc['text']}
 """
+        )
 
-    prompt = (
-        ChatPromptTemplate
-        .from_template(template)
-    )
-
-    chain = (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
+    context = "\n\n".join(context_parts)
 
     # --------------------------------------------------------
-    # Generate answer
+    # Ask Groq
     # --------------------------------------------------------
+
+    answer = ask_groq(
+        question,
+        context,
+    )
+
+    return answer, retrieved_docs
+
+
+# ============================================================
+# SOURCE DISPLAY
+# ============================================================
+
+def display_sources(documents):
+    """Display sources used for the answer."""
+
+    if not documents:
+        return
+
+    with st.expander("📚 Sources used"):
+        seen = set()
+
+        for doc in documents:
+            key = (
+                doc["filename"],
+                doc["page"],
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            st.write(
+                f"📄 **{doc['filename']}** — "
+                f"Page {doc['page']}"
+            )
+
+
+# ============================================================
+# PDF VIEWER
+# ============================================================
+
+def display_pdf_viewer(pdf_data):
+    """Display uploaded PDF pages."""
+
+    if not pdf_data:
+        return
+
+    st.subheader("📖 PDF Viewer")
 
     try:
-
-        response = chain.invoke(
-            {
-                "context":
-                    formatted_context,
-
-                "question":
-                    question,
-            }
+        pdf = pymupdf.open(
+            stream=pdf_data["bytes"],
+            filetype="pdf",
         )
+
+        total_pages = len(pdf)
+
+        page_number = st.number_input(
+            "Page",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+        )
+
+        page = pdf[page_number - 1]
+
+        pix = page.get_pixmap(
+            matrix=pymupdf.Matrix(1.2, 1.2),
+            alpha=False,
+        )
+
+        image_bytes = pix.tobytes("png")
+
+        st.image(
+            image_bytes,
+            caption=(
+                f"{pdf_data['filename']} - "
+                f"Page {page_number}"
+            ),
+            use_container_width=True,
+        )
+
+        pdf.close()
 
     except Exception as e:
+        st.error(f"Could not display PDF: {e}")
 
-        logger.error(
-            f"Error generating response: {e}"
-        )
 
-        return (
-            f"Sorry, I could not generate "
-            f"an answer.\n\nError: {e}",
-            [],
-        )
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-    # --------------------------------------------------------
-    # Sources
-    # --------------------------------------------------------
+def sidebar():
+    """Render sidebar."""
 
-    source_details = [
-        {
-            "pdf_name":
-                doc.metadata.get(
-                    "pdf_name",
-                    "Unknown file",
-                ),
+    st.sidebar.title("📄 PDF Manager")
 
-            "pdf_id":
-                doc.metadata.get(
-                    "pdf_id"
-                ),
-
-            "page":
-                doc.metadata.get(
-                    "page",
-                    "Unknown",
-                ),
-
-            "chunk_index":
-                doc.metadata.get(
-                    "chunk_index",
-                    0,
-                ),
-        }
-
-        for doc
-        in all_retrieved_docs[:4]
-    ]
-
-    return (
-        response,
-        source_details,
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
     )
 
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            process_pdf(uploaded_file)
 
-# ============================================================
-# DELETE VECTOR DATABASE
-# ============================================================
+    st.sidebar.divider()
 
-def delete_vector_db(
-    vector_db: Optional[Chroma]
-) -> None:
+    if st.session_state.pdfs:
 
-    if vector_db is not None:
+        st.sidebar.subheader("Uploaded PDFs")
 
-        try:
+        pdf_ids = list(st.session_state.pdfs.keys())
 
-            vector_db.delete_collection()
+        for pdf_id in pdf_ids:
 
-            st.session_state.pop(
-                "pdf_pages",
-                None
+            pdf_data = st.session_state.pdfs[pdf_id]
+
+            col1, col2 = st.sidebar.columns(
+                [4, 1]
             )
 
-            st.session_state.pop(
-                "file_upload",
-                None
-            )
+            with col1:
+                if st.button(
+                    pdf_data["filename"],
+                    key=f"select_{pdf_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.active_pdf_id = pdf_id
 
-            st.session_state.pop(
-                "vector_db",
-                None
-            )
+            with col2:
+                if st.button(
+                    "🗑️",
+                    key=f"delete_{pdf_id}",
+                ):
+                    delete_pdf(pdf_id)
+                    st.rerun()
 
-            st.success(
-                "Collection deleted successfully."
-            )
+        st.sidebar.divider()
 
+        if st.sidebar.button(
+            "🗑️ Delete all PDFs",
+            use_container_width=True,
+        ):
+            delete_all_pdfs()
             st.rerun()
 
-        except Exception as e:
-
-            st.error(
-                f"Error deleting collection: {e}"
-            )
-
     else:
-
-        st.error(
-            "No vector database found."
+        st.sidebar.info(
+            "Upload one or more PDFs to start."
         )
 
 
@@ -1146,727 +595,155 @@ def delete_vector_db(
 
 def main():
 
-    st.subheader(
-        "🧠 Secure PDF RAG Assistant",
-        divider="gray",
-        anchor=False,
+    sidebar()
+
+    st.title("🔐 Secure PDF RAG Assistant")
+
+    st.caption(
+        "Ask questions about your uploaded company documents."
     )
 
     # --------------------------------------------------------
-    # Session state
+    # No PDFs
     # --------------------------------------------------------
 
-    if "messages" not in st.session_state:
+    if not st.session_state.pdfs:
 
-        st.session_state[
-            "messages"
-        ] = []
-
-    if "pdfs" not in st.session_state:
-
-        st.session_state[
-            "pdfs"
-        ] = {}
-
-    if "active_pdfs" not in st.session_state:
-
-        st.session_state[
-            "active_pdfs"
-        ] = []
-
-    if "vector_db" not in st.session_state:
-
-        st.session_state[
-            "vector_db"
-        ] = None
-
-    # --------------------------------------------------------
-    # Model configuration
-    # --------------------------------------------------------
-
-    groq_api_key = os.getenv(
-        "GROQ_API_KEY"
-    )
-
-    if groq_api_key:
-
-        available_models = (
-            GROQ_MODEL,
+        st.info(
+            "Upload a PDF from the sidebar to start "
+            "asking questions."
         )
 
-    else:
+        st.markdown(
+            """
+### How it works
 
-        try:
+1. Upload a company PDF.
+2. The application extracts the PDF text.
+3. Relevant sections are retrieved using TF-IDF.
+4. The retrieved context is sent to Groq.
+5. The AI generates an answer using the PDF context.
+"""
+        )
 
-            # Lazy import:
-            # Ollama is only needed locally.
-            import ollama
-
-            models_info = (
-                ollama.list()
-            )
-
-            available_models = (
-                extract_model_names(
-                    models_info
-                )
-            )
-
-        except Exception as e:
-
-            logger.error(
-                f"Could not connect to Ollama: {e}"
-            )
-
-            available_models = ()
+        return
 
     # --------------------------------------------------------
-    # Layout
+    # PDF selection
     # --------------------------------------------------------
 
-    col1, col2 = st.columns(
-        [1.5, 2]
+    pdf_ids = list(st.session_state.pdfs.keys())
+
+    selected_pdf_ids = st.multiselect(
+        "Select PDFs to search",
+        options=pdf_ids,
+        default=pdf_ids,
+        format_func=lambda pdf_id:
+            st.session_state.pdfs[pdf_id]["filename"],
+    )
+
+    if not selected_pdf_ids:
+        st.warning(
+            "Please select at least one PDF."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Main layout
+    # --------------------------------------------------------
+
+    chat_col, viewer_col = st.columns(
+        [1.4, 1]
     )
 
     # --------------------------------------------------------
-    # Model selector
-    # --------------------------------------------------------
-
-    if groq_api_key:
-
-        selected_model = GROQ_MODEL
-
-        col2.success(
-            "☁️ Using Groq cloud model"
-        )
-
-    elif available_models:
-
-        selected_model = (
-            col2.selectbox(
-                "Pick a local Ollama model ↓",
-                available_models,
-                key="model_select",
-            )
-        )
-
-    else:
-
-        selected_model = (
-            OLLAMA_DEFAULT_MODEL
-        )
-
-        col2.warning(
-            "Ollama is not available. "
-            "Add GROQ_API_KEY for cloud deployment."
-        )
-
-    # ========================================================
-    # SIDEBAR
-    # ========================================================
-
-    with st.sidebar:
-
-        st.divider()
-
-        st.subheader(
-            "📚 Loaded PDFs"
-        )
-
-        if st.session_state.get("pdfs"):
-
-            total_pdfs = len(
-                st.session_state["pdfs"]
-            )
-
-            total_chunks = sum(
-                pdf["doc_count"]
-                for pdf
-                in st.session_state[
-                    "pdfs"
-                ].values()
-            )
-
-            st.metric(
-                "Total PDFs",
-                total_pdfs,
-            )
-
-            st.metric(
-                "Total Chunks",
-                total_chunks,
-            )
-
-            st.divider()
-
-            for pdf_id in (
-                st.session_state[
-                    "active_pdfs"
-                ]
-            ):
-
-                if pdf_id not in (
-                    st.session_state[
-                        "pdfs"
-                    ]
-                ):
-
-                    continue
-
-                pdf_data = (
-                    st.session_state[
-                        "pdfs"
-                    ][pdf_id]
-                )
-
-                with st.expander(
-                    f"📄 {pdf_data['name']}",
-                    expanded=False,
-                ):
-
-                    st.caption(
-                        f"Chunks: "
-                        f"{pdf_data['doc_count']}"
-                    )
-
-                    st.caption(
-                        f"Pages: "
-                        f"{pdf_data['page_count']}"
-                    )
-
-                    if st.button(
-                        "🗑️ Delete",
-                        key=f"delete_{pdf_id}",
-                    ):
-
-                        delete_pdf(
-                            pdf_id
-                        )
-
-                        st.rerun()
-
-            st.divider()
-
-            if st.button(
-                "🗑️ Delete All PDFs"
-            ):
-
-                delete_all_pdfs()
-
-                st.rerun()
-
-        else:
-
-            st.info(
-                "No PDFs loaded yet."
-            )
-
-    # ========================================================
-    # SAMPLE PDF
-    # ========================================================
-
-    use_sample = col1.toggle(
-        "Use sample PDF (Scammer Agent Paper)",
-        key="sample_checkbox",
-    )
-
-    # ========================================================
-    # UPLOAD PDF
-    # ========================================================
-
-    if use_sample:
-
-        sample_pdf_path = Path(
-            "data/pdfs/sample/scammer-agent.pdf"
-        )
-
-        if sample_pdf_path.exists():
-
-            sample_id = "sample_pdf"
-
-            if sample_id not in (
-                st.session_state[
-                    "pdfs"
-                ]
-            ):
-
-                with st.spinner(
-                    "Processing sample PDF..."
-                ):
-
-                    with open(
-                        sample_pdf_path,
-                        "rb",
-                    ) as f:
-
-                        file_bytes = f.read()
-
-                    class SampleFile:
-
-                        def __init__(
-                            self,
-                            path,
-                            content,
-                        ):
-
-                            self.name = (
-                                path.name
-                            )
-
-                            self._content = (
-                                content
-                            )
-
-                        def getvalue(self):
-
-                            return self._content
-
-                    sample_file = (
-                        SampleFile(
-                            sample_pdf_path,
-                            file_bytes,
-                        )
-                    )
-
-                    process_and_store_pdf(
-                        sample_file,
-                        sample_id,
-                        is_sample=True,
-                    )
-
-        else:
-
-            st.error(
-                "Sample PDF not found."
-            )
-
-    else:
-
-        file_uploads = (
-            col1.file_uploader(
-                "Upload PDF files ↓",
-                type="pdf",
-                accept_multiple_files=True,
-                key="pdf_uploader",
-            )
-        )
-
-        if file_uploads:
-
-            for file_upload in file_uploads:
-
-                pdf_id = (
-                    generate_pdf_id(
-                        file_upload
-                    )
-                )
-
-                if pdf_id not in (
-                    st.session_state[
-                        "pdfs"
-                    ]
-                ):
-
-                    with st.spinner(
-                        f"Processing "
-                        f"{file_upload.name}..."
-                    ):
-
-                        try:
-
-                            process_and_store_pdf(
-                                file_upload,
-                                pdf_id,
-                            )
-
-                        except Exception as e:
-
-                            st.error(
-                                f"Error processing "
-                                f"{file_upload.name}: {e}"
-                            )
-
-                            logger.error(
-                                f"PDF processing error: {e}"
-                            )
-
-    # ========================================================
-    # PDF VIEWER
-    # ========================================================
-
-    if (
-        st.session_state.get("pdfs")
-        and
-        st.session_state.get("active_pdfs")
-    ):
-
-        zoom_level = col1.slider(
-            "Zoom Level",
-            min_value=100,
-            max_value=1000,
-            value=700,
-            step=50,
-            key="zoom_slider",
-        )
-
-        with col1:
-
-            with st.container(
-                height=410,
-                border=True,
-            ):
-
-                for pdf_id in (
-                    st.session_state[
-                        "active_pdfs"
-                    ]
-                ):
-
-                    if pdf_id not in (
-                        st.session_state[
-                            "pdfs"
-                        ]
-                    ):
-
-                        continue
-
-                    pdf_data = (
-                        st.session_state[
-                            "pdfs"
-                        ][pdf_id]
-                    )
-
-                    st.markdown(
-                        f"### 📄 "
-                        f"{pdf_data['name']}"
-                    )
-
-                    st.caption(
-                        f"Uploaded: "
-                        f"{pdf_data['upload_timestamp'].strftime('%Y-%m-%d %H:%M')} "
-                        f"| Chunks: "
-                        f"{pdf_data['doc_count']} "
-                        f"| Pages: "
-                        f"{pdf_data['page_count']}"
-                    )
-
-                    if st.button(
-                        "🗑️ Remove",
-                        key=f"remove_{pdf_id}",
-                    ):
-
-                        delete_pdf(
-                            pdf_id
-                        )
-
-                        st.rerun()
-
-                    st.divider()
-
-                    viewer_pdf = pymupdf.open(
-                        stream=pdf_data[
-                            "file_bytes"
-                        ],
-                        filetype="pdf",
-                    )
-
-                    for page_idx, page in enumerate(
-                        viewer_pdf
-                    ):
-
-                        st.caption(
-                            f"Page "
-                            f"{page_idx + 1}"
-                        )
-
-                        pixmap = (
-                            page.get_pixmap(
-                                matrix=pymupdf.Matrix(
-                                    1.2,
-                                    1.2,
-                                ),
-                                alpha=False,
-                            )
-                        )
-
-                        st.image(
-                            pixmap.tobytes(
-                                "png"
-                            ),
-                            width=zoom_level,
-                        )
-
-                    viewer_pdf.close()
-
-                    st.markdown(
-                        "---"
-                    )
-
-    else:
-
-        col1.info(
-            "Upload PDF files to view them here."
-        )
-
-    # ========================================================
-    # DELETE COLLECTION
-    # ========================================================
-
-    delete_collection = col1.button(
-        "⚠️ Delete collection",
-        type="secondary",
-        key="delete_button",
-    )
-
-    if delete_collection:
-
-        delete_vector_db(
-            st.session_state[
-                "vector_db"
-            ]
-        )
-
-    # ========================================================
     # CHAT
-    # ========================================================
+    # --------------------------------------------------------
 
-    with col2:
+    with chat_col:
 
-        message_container = (
-            st.container(
-                height=500,
-                border=True,
-            )
-        )
+        st.subheader("💬 Ask your PDF")
 
-        # ----------------------------------------------------
-        # Chat history
-        # ----------------------------------------------------
+        for message in st.session_state.messages:
 
-        for message in (
-            st.session_state[
-                "messages"
-            ]
-        ):
-
-            avatar = (
-                "🤖"
-                if message["role"]
-                == "assistant"
-                else "😎"
-            )
-
-            with message_container.chat_message(
-                message["role"],
-                avatar=avatar,
+            with st.chat_message(
+                message["role"]
             ):
-
                 st.markdown(
                     message["content"]
                 )
 
                 if (
-                    message["role"]
-                    == "assistant"
-                    and
-                    "sources" in message
+                    message["role"] == "assistant"
+                    and message.get("sources")
                 ):
-
-                    st.divider()
-
-                    st.caption(
-                        "📚 Sources:"
+                    display_sources(
+                        message["sources"]
                     )
 
-                    sources_by_pdf = {}
-
-                    for src in (
-                        message["sources"]
-                    ):
-
-                        pdf_name = src.get(
-                            "pdf_name",
-                            "Unknown",
-                        )
-
-                        if pdf_name not in (
-                            sources_by_pdf
-                        ):
-
-                            sources_by_pdf[
-                                pdf_name
-                            ] = 0
-
-                        sources_by_pdf[
-                            pdf_name
-                        ] += 1
-
-                    for (
-                        pdf_name,
-                        count
-                    ) in (
-                        sources_by_pdf.items()
-                    ):
-
-                        st.markdown(
-                            f"- **{pdf_name}** "
-                            f"({count} chunks)"
-                        )
-
-        # ----------------------------------------------------
-        # User question
-        # ----------------------------------------------------
-
-        prompt = st.chat_input(
-            "Ask a question about your PDFs..."
+        question = st.chat_input(
+            "Ask a question about the PDF..."
         )
 
-        if prompt:
+        if question:
 
-            try:
+            st.session_state.messages.append(
+                {
+                    "role": "user",
+                    "content": question,
+                }
+            )
 
-                st.session_state[
-                    "messages"
-                ].append(
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                )
+            with st.chat_message("user"):
+                st.markdown(question)
 
-                with message_container.chat_message(
-                    "user",
-                    avatar="😎",
+            with st.chat_message("assistant"):
+
+                with st.spinner(
+                    "Searching the PDF..."
                 ):
 
-                    st.markdown(
-                        prompt
+                    answer, sources = process_question(
+                        question,
+                        selected_pdf_ids,
                     )
 
-                # ------------------------------------------------
-                # Generate answer
-                # ------------------------------------------------
+                st.markdown(answer)
 
-                with message_container.chat_message(
-                    "assistant",
-                    avatar="🤖",
-                ):
+                if sources:
+                    display_sources(sources)
 
-                    with st.spinner(
-                        "Searching documents..."
-                    ):
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources,
+                }
+            )
 
-                        if st.session_state.get(
-                            "pdfs"
-                        ):
+    # --------------------------------------------------------
+    # PDF VIEWER
+    # --------------------------------------------------------
 
-                            (
-                                response,
-                                sources,
-                            ) = (
-                                process_question_multi_pdf(
-                                    prompt,
-                                    st.session_state[
-                                        "pdfs"
-                                    ],
-                                    selected_model,
-                                )
-                            )
+    with viewer_col:
 
-                            st.markdown(
-                                response
-                            )
+        active_id = st.session_state.active_pdf_id
 
-                            if sources:
-
-                                st.divider()
-
-                                st.caption(
-                                    "📚 Sources:"
-                                )
-
-                                sources_by_pdf = {}
-
-                                for src in sources:
-
-                                    pdf_name = (
-                                        src.get(
-                                            "pdf_name",
-                                            "Unknown",
-                                        )
-                                    )
-
-                                    if pdf_name not in (
-                                        sources_by_pdf
-                                    ):
-
-                                        sources_by_pdf[
-                                            pdf_name
-                                        ] = 0
-
-                                    sources_by_pdf[
-                                        pdf_name
-                                    ] += 1
-
-                                for (
-                                    pdf_name,
-                                    count,
-                                ) in (
-                                    sources_by_pdf.items()
-                                ):
-
-                                    st.markdown(
-                                        f"- **{pdf_name}** "
-                                        f"({count} chunks)"
-                                    )
-
-                        else:
-
-                            st.warning(
-                                "Please upload "
-                                "PDF files first."
-                            )
-
-                            response = None
-                            sources = None
-
-                # ------------------------------------------------
-                # Save response
-                # ------------------------------------------------
-
-                if response:
-
-                    st.session_state[
-                        "messages"
-                    ].append(
-                        {
-                            "role": "assistant",
-                            "content": response,
-                            "sources": sources,
-                        }
-                    )
-
-            except Exception as e:
-
-                st.error(
-                    str(e),
-                    icon="⛔",
-                )
-
-                logger.error(
-                    f"Error processing prompt: {e}"
-                )
+        if (
+            active_id
+            and active_id in st.session_state.pdfs
+        ):
+            display_pdf_viewer(
+                st.session_state.pdfs[active_id]
+            )
 
         else:
 
-            if not st.session_state.get(
-                "pdfs"
-            ):
+            first_pdf_id = selected_pdf_ids[0]
 
-                st.warning(
-                    "Upload PDF files or use "
-                    "the sample PDF to begin."
-                )
+            display_pdf_viewer(
+                st.session_state.pdfs[first_pdf_id]
+            )
 
 
 # ============================================================
